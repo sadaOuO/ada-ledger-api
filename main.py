@@ -1,5 +1,6 @@
-import json
+=import json
 import os
+import re
 import time
 import uuid
 
@@ -59,9 +60,9 @@ def load_log():
     return json.loads(raw) if raw else []
 
 
-def push_log(name: str):
+def push_log(name: str, amount: int = 1):
     log = load_log()
-    log.insert(0, {"name": name, "time": time.strftime("%m/%d %H:%M")})
+    log.insert(0, {"name": name, "amount": amount, "time": time.strftime("%m/%d %H:%M")})
     log = log[:LOG_MAX]
     redis.set(LOG_KEY, json.dumps(log, ensure_ascii=False))
     return log
@@ -79,8 +80,37 @@ async def tg_send_message(chat_id: int, text: str):
 def format_items_text(items):
     if not items:
         return "目前沒有任何項目。"
-    lines = [f"{it['name']}：{it['qty']}" for it in items]
+    lines = [f"{i+1}. {it['name']}：{it['qty']}" for i, it in enumerate(items)]
     return "📦 目前庫存\n" + "\n".join(lines)
+
+
+def apply_delta_by_id(item_id: str, delta: int):
+    """依 item id 調整數量，delta 可正可負，負數時記錄扣減紀錄。"""
+    items = load_items()
+    target = None
+    for it in items:
+        if it["id"] == item_id:
+            it["qty"] = max(0, it["qty"] + delta)
+            target = it
+    if target is None:
+        return None, None
+    save_items(items)
+    log = load_log()
+    if delta < 0:
+        log = push_log(target["name"], abs(delta))
+    return items, log
+
+
+def apply_delta_by_position(position: int, amount: int):
+    """依畫面上第 N 個項目(1-based)扣減 amount 次(每次 -1)。"""
+    items = load_items()
+    if position < 1 or position > len(items):
+        return None, None, None
+    item = items[position - 1]
+    item["qty"] = max(0, item["qty"] - amount)
+    save_items(items)
+    log = push_log(item["name"], amount)
+    return items, log, item
 
 
 # ---------- API models ----------
@@ -88,8 +118,9 @@ class AdjustBody(BaseModel):
     delta: int
 
 
-class RenameBody(BaseModel):
-    name: str
+class UpdateItemBody(BaseModel):
+    name: str | None = None
+    qty: int | None = None
 
 
 class AddItemBody(BaseModel):
@@ -113,29 +144,27 @@ def add_item(body: AddItemBody):
 
 
 @app.patch("/api/items/{item_id}")
-def rename_item(item_id: str, body: RenameBody):
+def update_item(item_id: str, body: UpdateItemBody):
     items = load_items()
+    found = False
     for it in items:
         if it["id"] == item_id:
-            it["name"] = body.name
+            if body.name is not None:
+                it["name"] = body.name
+            if body.qty is not None:
+                it["qty"] = max(0, body.qty)
+            found = True
+    if not found:
+        raise HTTPException(status_code=404, detail="item not found")
     save_items(items)
     return {"items": items}
 
 
 @app.post("/api/items/{item_id}/adjust")
 def adjust_item(item_id: str, body: AdjustBody):
-    items = load_items()
-    target = None
-    for it in items:
-        if it["id"] == item_id:
-            it["qty"] = max(0, it["qty"] + body.delta)
-            target = it
-    if target is None:
+    items, log = apply_delta_by_id(item_id, body.delta)
+    if items is None:
         raise HTTPException(status_code=404, detail="item not found")
-    save_items(items)
-    log = load_log()
-    if body.delta < 0:
-        log = push_log(target["name"])
     return {"items": items, "log": log}
 
 
@@ -166,20 +195,34 @@ async def telegram_webhook(
     if text == "/start":
         await tg_send_message(
             chat_id,
-            "歡迎使用庫存記帳！點左下角的選單按鈕開啟介面，或輸入 /list 查看目前庫存。",
+            "歡迎使用庫存記帳！點左下角的選單按鈕開啟介面，或輸入 /list 查看目前庫存。\n"
+            "也可以直接打 -N 扣第 N 個項目 1 個，例如 -2；打 -N*M 扣 M 個，例如 -1*4。",
         )
     elif text == "/list":
         items = load_items()
         await tg_send_message(chat_id, format_items_text(items))
-    elif "web_app_data" in message:
-        # 保留相容：如果之後有地方還是用 sendData 送資料回來
-        try:
-            data = json.loads(message["web_app_data"]["data"])
-            if "items" in data:
-                save_items(data["items"])
-            await tg_send_message(chat_id, "已收到並更新庫存資料 ✅")
-        except Exception:
-            await tg_send_message(chat_id, "收到資料，但格式無法解析。")
+    else:
+        match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text.strip())
+        if match:
+            position = int(match.group(1))
+            amount = int(match.group(2)) if match.group(2) else 1
+            items, log, item = apply_delta_by_position(position, amount)
+            if items is None:
+                await tg_send_message(chat_id, f"沒有第 {position} 個項目，目前只有 {len(load_items())} 個。")
+            else:
+                await tg_send_message(
+                    chat_id,
+                    f"已扣減「{item['name']}」{amount} 個，剩餘 {item['qty']}。",
+                )
+        elif "web_app_data" in message:
+            # 保留相容：如果之後有地方還是用 sendData 送資料回來
+            try:
+                data = json.loads(message["web_app_data"]["data"])
+                if "items" in data:
+                    save_items(data["items"])
+                await tg_send_message(chat_id, "已收到並更新庫存資料 ✅")
+            except Exception:
+                await tg_send_message(chat_id, "收到資料，但格式無法解析。")
 
     return {"ok": True}
 
