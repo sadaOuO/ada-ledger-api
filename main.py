@@ -22,6 +22,16 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://sadaouo.github.io")
 ADMIN_TELEGRAM_IDS = {
     int(x) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip().isdigit()
 }
+# 保護 cron 觸發端點用的密鑰，外部排程服務呼叫時要帶這組
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+# 日結／月結訊息要發送到哪些 Telegram 對話，逗號分隔（私聊用你的使用者 ID，群組用負數 ID）
+TARGET_CHAT_IDS = [
+    int(x) for x in os.environ.get("TARGET_CHAT_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+]
+# Google 試算表 ID（從網址列複製，/d/ 和 /edit 中間那一段）
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH", "/etc/secrets/google-credentials.json")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -38,6 +48,74 @@ SALE_TX_MAX = 2000
 TW_TZ = timezone(timedelta(hours=8))
 
 app = FastAPI()
+
+# ---------- Google 試算表 ----------
+def get_sheet():
+    """回傳試算表物件；沒設定憑證或 Sheet ID 就回傳 None（跳過寫入，不影響其他功能）。"""
+    if not GOOGLE_SHEET_ID or not os.path.exists(GOOGLE_CREDS_PATH):
+        return None
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client.open_by_key(GOOGLE_SHEET_ID)
+    except Exception as e:
+        print(f"[google sheet] 連線失敗：{e}")
+        return None
+
+
+def get_or_create_worksheet(sheet, name: str, headers: list):
+    import gspread
+
+    try:
+        return sheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=name, rows=2000, cols=len(headers) + 2)
+        ws.append_row(headers)
+        return ws
+
+
+def sheet_append_daily(summary):
+    sheet = get_sheet()
+    if sheet is None:
+        return
+    try:
+        ws_daily = get_or_create_worksheet(sheet, "每日日結", ["日期", "筆數", "總收款", "總成本", "總淨賺"])
+        ws_daily.append_row([
+            summary["date"], summary["count"],
+            summary["total_received"], summary["total_cost"], summary["total_profit"],
+        ])
+
+        ws_tx = get_or_create_worksheet(
+            sheet, "交易明細",
+            ["日期", "時間", "客戶", "收款", "面額", "人民幣匯率", "買進匯率", "成本", "淨賺"],
+        )
+        rows = [
+            [t["date"], t["time"], t["customer"], t["received"], t["usd"],
+             t["rmb_rate"], t["buy_rate"], t["cost"], t["profit"]]
+            for t in reversed(summary["transactions"])
+        ]
+        if rows:
+            ws_tx.append_rows(rows)
+    except Exception as e:
+        print(f"[google sheet] 寫入日結失敗：{e}")
+
+
+def sheet_append_month(summary):
+    sheet = get_sheet()
+    if sheet is None:
+        return
+    try:
+        ws = get_or_create_worksheet(sheet, "每月月結", ["月份", "筆數", "總收款", "總成本", "總淨賺"])
+        ws.append_row([
+            summary["month"], summary["count"],
+            summary["total_received"], summary["total_cost"], summary["total_profit"],
+        ])
+    except Exception as e:
+        print(f"[google sheet] 寫入月結失敗：{e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -225,17 +303,37 @@ def update_transaction(tx_id: str, customer=None, received=None, usd=None, rmb_r
     return target, tx_list
 
 
-def get_today_summary():
-    date = today_str()
-    today_tx = [t for t in load_transactions() if t["date"] == date]
-    total_received = round(sum(t["received"] for t in today_tx), 2)
-    total_cost = round(sum(t["cost"] for t in today_tx), 2)
-    total_profit = round(sum(t["profit"] for t in today_tx), 2)
+def get_date_summary(date: str):
+    date_tx = [t for t in load_transactions() if t["date"] == date]
+    total_received = round(sum(t["received"] for t in date_tx), 2)
+    total_cost = round(sum(t["cost"] for t in date_tx), 2)
+    total_profit = round(sum(t["profit"] for t in date_tx), 2)
     return {
         "date": date,
-        "rate": load_rate(),
-        "transactions": list(reversed(today_tx)),
-        "count": len(today_tx),
+        "transactions": list(reversed(date_tx)),
+        "count": len(date_tx),
+        "total_received": total_received,
+        "total_cost": total_cost,
+        "total_profit": total_profit,
+    }
+
+
+def get_today_summary():
+    summary = get_date_summary(today_str())
+    summary["rate"] = load_rate()
+    return summary
+
+
+def get_month_summary(month: str):
+    """month 格式 'YYYY-MM'，統計該月所有交易。"""
+    month_tx = [t for t in load_transactions() if t["date"].startswith(month)]
+    total_received = round(sum(t["received"] for t in month_tx), 2)
+    total_cost = round(sum(t["cost"] for t in month_tx), 2)
+    total_profit = round(sum(t["profit"] for t in month_tx), 2)
+    return {
+        "month": month,
+        "transactions": list(reversed(month_tx)),
+        "count": len(month_tx),
         "total_received": total_received,
         "total_cost": total_cost,
         "total_profit": total_profit,
@@ -250,6 +348,18 @@ def format_summary_text(summary):
         lines.append(f"{t['time']} {t['customer']}：收{t['received']}／賺{t['profit']}")
     lines.append(f"\n共 {summary['count']} 筆，總收款 {summary['total_received']}，總成本 {summary['total_cost']}，總淨賺 {summary['total_profit']}")
     return "\n".join(lines)
+
+
+def format_month_summary_text(summary):
+    if summary["count"] == 0:
+        return f"📊 {summary['month']} 月結：這個月還沒有交易紀錄。"
+    return (
+        f"📊 {summary['month']} 月結\n"
+        f"共 {summary['count']} 筆\n"
+        f"總收款：{summary['total_received']}\n"
+        f"總成本：{summary['total_cost']}\n"
+        f"總淨賺：{summary['total_profit']}"
+    )
 
 
 class AdjustBody(BaseModel):
@@ -394,9 +504,12 @@ async def telegram_webhook(
     text = message.get("text", "").strip()
     user_id = message.get("from", {}).get("id")
 
-    # /myid 永遠可用，方便你查自己的 Telegram ID 拿去設定管理員名單
+    # /myid、/chatid 永遠可用，方便你查 ID 拿去設定管理員名單或通知對象
     if text == "/myid":
         await tg_send_message(chat_id, f"你的 Telegram ID 是：{user_id}")
+        return {"ok": True}
+    if text == "/chatid":
+        await tg_send_message(chat_id, f"這個對話的 Chat ID 是：{chat_id}")
         return {"ok": True}
 
     # 管理員權限檢查：設定了 ADMIN_TELEGRAM_IDS 才會限制，沒設定就不限制任何人
@@ -483,6 +596,47 @@ async def telegram_webhook(
                 await tg_send_message(chat_id, "收到資料，但格式無法解析。")
 
     return {"ok": True}
+
+
+# ---------- Cron 觸發端點（給外部排程服務呼叫）----------
+@app.api_route("/api/cron/daily-close", methods=["GET", "POST"])
+async def cron_daily_close(token: str = ""):
+    if not CRON_SECRET or token != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="invalid token")
+
+    # 排程請設定在 23:59（快到但還沒跨過 0 點）觸發，抓「當天」的資料最穩，
+    # 避免跨過午夜、Render 冷啟動延遲等因素導致抓到隔天空白的日期。
+    close_date = today_str()
+    summary = get_date_summary(close_date)
+    text = format_summary_text(summary)
+    for cid in TARGET_CHAT_IDS:
+        try:
+            await tg_send_message(cid, text)
+        except Exception as e:
+            print(f"[cron daily] 發送給 {cid} 失敗：{e}")
+    sheet_append_daily(summary)
+    return {"ok": True, "date": close_date, "count": summary["count"]}
+
+
+@app.api_route("/api/cron/monthly-close", methods=["GET", "POST"])
+async def cron_monthly_close(token: str = ""):
+    if not CRON_SECRET or token != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="invalid token")
+
+    now = datetime.now(TW_TZ)
+    first_of_this_month = now.replace(day=1)
+    last_month_end = first_of_this_month - timedelta(days=1)
+    month_str = last_month_end.strftime("%Y-%m")
+
+    summary = get_month_summary(month_str)
+    text = format_month_summary_text(summary)
+    for cid in TARGET_CHAT_IDS:
+        try:
+            await tg_send_message(cid, text)
+        except Exception as e:
+            print(f"[cron monthly] 發送給 {cid} 失敗：{e}")
+    sheet_append_month(summary)
+    return {"ok": True, "month": month_str, "count": summary["count"]}
 
 
 @app.get("/")
