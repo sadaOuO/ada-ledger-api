@@ -169,13 +169,16 @@ def compute_cost(usd: float, buy_rate: float, rmb_rate: float):
 
 
 def add_transaction(customer: str, received: float, usd: float, rmb_rate: float = None, buy_rate: float = None):
-    """新增一筆代儲交易。若有帶 rmb_rate/buy_rate 則只用在這一筆，不影響當天預設匯率。"""
-    rate = load_rate()
+    """新增一筆代儲交易。rmb_rate／buy_rate 可以各自獨立覆寫（例如非美金計價商品只覆寫買進匯率），
+    沒帶的那個會用當天預設匯率，只用在這一筆，不影響當天預設匯率本身。"""
     if rmb_rate is None or buy_rate is None:
-        if rate is None:
+        rate = load_rate()
+        if rate is None and (rmb_rate is None or buy_rate is None):
             return None, None
-        rmb_rate = rate["rmb_rate"]
-        buy_rate = rate["buy_rate"]
+        if rmb_rate is None:
+            rmb_rate = rate["rmb_rate"]
+        if buy_rate is None:
+            buy_rate = rate["buy_rate"]
     cost = compute_cost(usd, buy_rate, rmb_rate)
     profit = round(received - cost, 2)
     tx = {
@@ -409,6 +412,7 @@ async def telegram_webhook(
             "代儲記帳：先設定今日匯率 /匯率 人民幣匯率 買進匯率，例如 /匯率 4.36 5.05；\n"
             "之後直接打「客戶 收款 美金價格」新增一筆，例如 柯宇 2000 86；\n"
             "美金欄位支援乘法，例如 65*2 會算成 130；\n"
+            "非美金計價商品（面額×比例），可只覆寫買進匯率、沿用當天人民幣匯率，例如 路人乙 700 640 0.177；\n"
             "也可以整行帶自訂匯率，例如 路人甲 2900 100 4.83 5.85，只會套用在這一筆；\n"
             "打 /日結 查看今天總覽。",
         )
@@ -423,7 +427,7 @@ async def telegram_webhook(
         adjust_match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text)
         num_expr = r"\d+(?:\.\d+)?(?:\*\d+(?:\.\d+)?)?"
         tx_match = re.fullmatch(
-            rf"(\S+)\s+({num_expr})\s+({num_expr})(?:\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?))?",
+            rf"(\S+)\s+({num_expr})\s+({num_expr})(?:\s+(\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?))?)?",
             text,
         )
 
@@ -447,8 +451,16 @@ async def telegram_webhook(
             customer = tx_match.group(1)
             received = parse_amount_expr(tx_match.group(2))
             usd = parse_amount_expr(tx_match.group(3))
-            custom_rmb = float(tx_match.group(4)) if tx_match.group(4) else None
-            custom_buy = float(tx_match.group(5)) if tx_match.group(5) else None
+            extra1 = float(tx_match.group(4)) if tx_match.group(4) else None
+            extra2 = float(tx_match.group(5)) if tx_match.group(5) else None
+            if extra1 is not None and extra2 is not None:
+                # 帶兩個數字：依序是「人民幣匯率、買進匯率」，都只用在這一筆
+                custom_rmb, custom_buy = extra1, extra2
+            elif extra1 is not None:
+                # 只帶一個數字：視為「買進匯率／比例」覆寫，人民幣匯率沿用當天設定
+                custom_rmb, custom_buy = None, extra1
+            else:
+                custom_rmb, custom_buy = None, None
             tx, tx_list = add_transaction(customer, received, usd, custom_rmb, custom_buy)
             if tx is None:
                 await tg_send_message(chat_id, "今天還沒設定匯率，先打 /匯率 人民幣匯率 買進匯率，例如 /匯率 4.36 5.05")
@@ -456,7 +468,8 @@ async def telegram_webhook(
                 summary = get_today_summary()
                 await tg_send_message(
                     chat_id,
-                    f"已記錄「{customer}」：收款 {received}，成本 {tx['cost']}，淨賺 {tx['profit']}\n"
+                    f"已記錄「{customer}」：收款 {received}，成本 {tx['cost']}，淨賺 {tx['profit']}"
+                    f"（匯率 {tx['rmb_rate']}／{tx['buy_rate']}）\n"
                     f"今日累計 {summary['count']} 筆，總淨賺 {summary['total_profit']}",
                 )
         elif "web_app_data" in message:
