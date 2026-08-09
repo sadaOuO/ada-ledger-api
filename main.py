@@ -3,6 +3,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -25,6 +26,12 @@ redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 ITEMS_KEY = "ledger:items"
 LOG_KEY = "ledger:log"
 LOG_MAX = 50
+
+SALE_RATE_KEY = "sale:rate"
+SALE_TX_KEY = "sale:transactions"
+SALE_TX_MAX = 2000
+
+TW_TZ = timezone(timedelta(hours=8))
 
 app = FastAPI()
 
@@ -113,7 +120,92 @@ def apply_delta_by_position(position: int, amount: int):
     return items, log, item
 
 
-# ---------- API models ----------
+# ---------- 代儲交易記錄：資料存取 ----------
+def today_str():
+    return datetime.now(TW_TZ).strftime("%Y-%m-%d")
+
+
+def now_str():
+    return datetime.now(TW_TZ).strftime("%H:%M")
+
+
+def load_rate():
+    raw = redis.get(SALE_RATE_KEY)
+    return json.loads(raw) if raw else None
+
+
+def save_rate(rmb_rate: float, buy_rate: float):
+    rate = {"date": today_str(), "rmb_rate": rmb_rate, "buy_rate": buy_rate}
+    redis.set(SALE_RATE_KEY, json.dumps(rate, ensure_ascii=False))
+    return rate
+
+
+def load_transactions():
+    raw = redis.get(SALE_TX_KEY)
+    return json.loads(raw) if raw else []
+
+
+def save_transactions(tx_list):
+    redis.set(SALE_TX_KEY, json.dumps(tx_list, ensure_ascii=False))
+
+
+def compute_cost(usd: float, buy_rate: float, rmb_rate: float):
+    return round(usd * buy_rate * rmb_rate, 2)
+
+
+def add_transaction(customer: str, received: float, usd: float):
+    """新增一筆代儲交易，使用目前設定的匯率計算成本與淨賺。"""
+    rate = load_rate()
+    if rate is None:
+        return None, None
+    cost = compute_cost(usd, rate["buy_rate"], rate["rmb_rate"])
+    profit = round(received - cost, 2)
+    tx = {
+        "id": str(uuid.uuid4())[:8],
+        "date": today_str(),
+        "time": now_str(),
+        "customer": customer,
+        "received": received,
+        "usd": usd,
+        "rmb_rate": rate["rmb_rate"],
+        "buy_rate": rate["buy_rate"],
+        "cost": cost,
+        "profit": profit,
+    }
+    tx_list = load_transactions()
+    tx_list.append(tx)
+    tx_list = tx_list[-SALE_TX_MAX:]
+    save_transactions(tx_list)
+    return tx, tx_list
+
+
+def get_today_summary():
+    date = today_str()
+    today_tx = [t for t in load_transactions() if t["date"] == date]
+    total_received = round(sum(t["received"] for t in today_tx), 2)
+    total_cost = round(sum(t["cost"] for t in today_tx), 2)
+    total_profit = round(sum(t["profit"] for t in today_tx), 2)
+    return {
+        "date": date,
+        "rate": load_rate(),
+        "transactions": list(reversed(today_tx)),
+        "count": len(today_tx),
+        "total_received": total_received,
+        "total_cost": total_cost,
+        "total_profit": total_profit,
+    }
+
+
+def format_summary_text(summary):
+    if summary["count"] == 0:
+        return f"📅 {summary['date']} 目前還沒有交易紀錄。"
+    lines = [f"📅 {summary['date']} 日結"]
+    for t in summary["transactions"]:
+        lines.append(f"{t['time']} {t['customer']}：收{t['received']}／賺{t['profit']}")
+    lines.append(f"\n共 {summary['count']} 筆，總收款 {summary['total_received']}，總成本 {summary['total_cost']}，總淨賺 {summary['total_profit']}")
+    return "\n".join(lines)
+
+
 class AdjustBody(BaseModel):
     delta: int
 
@@ -126,6 +218,17 @@ class UpdateItemBody(BaseModel):
 class AddItemBody(BaseModel):
     name: str = "新項目"
     qty: int = 0
+
+
+class SetRateBody(BaseModel):
+    rmb_rate: float
+    buy_rate: float
+
+
+class AddTransactionBody(BaseModel):
+    customer: str
+    received: float
+    usd: float
 
 
 # ---------- 庫存 API（給 Mini App 網頁呼叫）----------
@@ -175,6 +278,33 @@ def delete_item(item_id: str):
     return {"items": items}
 
 
+# ---------- 代儲交易記錄 API（給 Mini App 網頁呼叫）----------
+@app.get("/api/sales/today")
+def api_get_today_summary():
+    return get_today_summary()
+
+
+@app.post("/api/sales/rate")
+def api_set_rate(body: SetRateBody):
+    rate = save_rate(body.rmb_rate, body.buy_rate)
+    return {"rate": rate}
+
+
+@app.post("/api/sales/transactions")
+def api_add_transaction(body: AddTransactionBody):
+    tx, tx_list = add_transaction(body.customer, body.received, body.usd)
+    if tx is None:
+        raise HTTPException(status_code=400, detail="今天還沒設定匯率")
+    return get_today_summary()
+
+
+@app.delete("/api/sales/transactions/{tx_id}")
+def api_delete_transaction(tx_id: str):
+    tx_list = [t for t in load_transactions() if t["id"] != tx_id]
+    save_transactions(tx_list)
+    return get_today_summary()
+
+
 # ---------- Telegram Webhook ----------
 @app.post("/webhook")
 async def telegram_webhook(
@@ -196,16 +326,30 @@ async def telegram_webhook(
         await tg_send_message(
             chat_id,
             "歡迎使用庫存記帳！點左下角的選單按鈕開啟介面，或輸入 /list 查看目前庫存。\n"
-            "也可以直接打 -N 扣第 N 個項目 1 個，例如 -2；打 -N*M 扣 M 個，例如 -1*4。",
+            "也可以直接打 -N 扣第 N 個項目 1 個，例如 -2；打 -N*M 扣 M 個，例如 -1*4。\n\n"
+            "代儲記帳：先設定今日匯率 /匯率 人民幣匯率 買進匯率，例如 /匯率 4.36 5.05；\n"
+            "之後直接打「客戶 收款 美金價格」新增一筆，例如 柯宇 2000 86；\n"
+            "打 /日結 查看今天總覽。",
         )
     elif text == "/list":
         items = load_items()
         await tg_send_message(chat_id, format_items_text(items))
+    elif text == "/日結":
+        summary = get_today_summary()
+        await tg_send_message(chat_id, format_summary_text(summary))
     else:
-        match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text.strip())
-        if match:
-            position = int(match.group(1))
-            amount = int(match.group(2)) if match.group(2) else 1
+        rate_match = re.fullmatch(r"/匯率\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", text.strip())
+        adjust_match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text.strip())
+        tx_match = re.fullmatch(r"(\S+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", text.strip())
+
+        if rate_match:
+            rmb_rate = float(rate_match.group(1))
+            buy_rate = float(rate_match.group(2))
+            save_rate(rmb_rate, buy_rate)
+            await tg_send_message(chat_id, f"已設定今日匯率：人民幣 {rmb_rate}／買進 {buy_rate}")
+        elif adjust_match:
+            position = int(adjust_match.group(1))
+            amount = int(adjust_match.group(2)) if adjust_match.group(2) else 1
             items, log, item = apply_delta_by_position(position, amount)
             if items is None:
                 await tg_send_message(chat_id, f"沒有第 {position} 個項目，目前只有 {len(load_items())} 個。")
@@ -213,6 +357,20 @@ async def telegram_webhook(
                 await tg_send_message(
                     chat_id,
                     f"已扣減「{item['name']}」{amount} 個，剩餘 {item['qty']}。",
+                )
+        elif tx_match:
+            customer = tx_match.group(1)
+            received = float(tx_match.group(2))
+            usd = float(tx_match.group(3))
+            tx, tx_list = add_transaction(customer, received, usd)
+            if tx is None:
+                await tg_send_message(chat_id, "今天還沒設定匯率，先打 /匯率 人民幣匯率 買進匯率，例如 /匯率 4.36 5.05")
+            else:
+                summary = get_today_summary()
+                await tg_send_message(
+                    chat_id,
+                    f"已記錄「{customer}」：收款 {received}，成本 {tx['cost']}，淨賺 {tx['profit']}\n"
+                    f"今日累計 {summary['count']} 筆，總淨賺 {summary['total_profit']}",
                 )
         elif "web_app_data" in message:
             # 保留相容：如果之後有地方還是用 sendData 送資料回來
