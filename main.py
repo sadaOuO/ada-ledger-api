@@ -84,6 +84,13 @@ def sheet_append_daily(summary):
         return
     try:
         ws_daily = get_or_create_worksheet(sheet, "每日日結", ["日期", "筆數", "總收款", "總成本", "總淨賺"])
+
+        # 防重複：如果這個日期已經寫過，就不再重複寫入（避免手動測試或排程重複觸發造成重複資料）
+        existing_dates = ws_daily.col_values(1)
+        if summary["date"] in existing_dates:
+            print(f"[google sheet] {summary['date']} 已經寫入過，跳過避免重複。")
+            return
+
         ws_daily.append_row([
             summary["date"], summary["count"],
             summary["total_received"], summary["total_cost"], summary["total_profit"],
@@ -110,6 +117,13 @@ def sheet_append_month(summary):
         return
     try:
         ws = get_or_create_worksheet(sheet, "每月月結", ["月份", "筆數", "總收款", "總成本", "總淨賺"])
+
+        # 防重複：這個月份已經寫過就跳過
+        existing_months = ws.col_values(1)
+        if summary["month"] in existing_months:
+            print(f"[google sheet] {summary['month']} 已經寫入過，跳過避免重複。")
+            return
+
         ws.append_row([
             summary["month"], summary["count"],
             summary["total_received"], summary["total_cost"], summary["total_profit"],
