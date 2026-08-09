@@ -18,6 +18,10 @@ UPSTASH_REDIS_REST_URL = os.environ["UPSTASH_REDIS_REST_URL"]
 UPSTASH_REDIS_REST_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 # 允許呼叫這支 API 的網頁來源，預設放你的 GitHub Pages 網址
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://sadaouo.github.io")
+# 允許使用 Bot 指令的 Telegram 使用者 ID，逗號分隔，例如 "111111,222222"；留空代表不限制
+ADMIN_TELEGRAM_IDS = {
+    int(x) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip().isdigit()
+}
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -149,16 +153,30 @@ def save_transactions(tx_list):
     redis.set(SALE_TX_KEY, json.dumps(tx_list, ensure_ascii=False))
 
 
+def parse_amount_expr(s: str) -> float:
+    """支援 '65' 或 '65*2' 這種帶乘法的數字輸入。"""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(?:\*(\d+(?:\.\d+)?))?", s.strip())
+    if not m:
+        raise ValueError(f"無法解析數字：{s}")
+    base = float(m.group(1))
+    if m.group(2):
+        base *= float(m.group(2))
+    return base
+
+
 def compute_cost(usd: float, buy_rate: float, rmb_rate: float):
     return round(usd * buy_rate * rmb_rate, 2)
 
 
-def add_transaction(customer: str, received: float, usd: float):
-    """新增一筆代儲交易，使用目前設定的匯率計算成本與淨賺。"""
+def add_transaction(customer: str, received: float, usd: float, rmb_rate: float = None, buy_rate: float = None):
+    """新增一筆代儲交易。若有帶 rmb_rate/buy_rate 則只用在這一筆，不影響當天預設匯率。"""
     rate = load_rate()
-    if rate is None:
-        return None, None
-    cost = compute_cost(usd, rate["buy_rate"], rate["rmb_rate"])
+    if rmb_rate is None or buy_rate is None:
+        if rate is None:
+            return None, None
+        rmb_rate = rate["rmb_rate"]
+        buy_rate = rate["buy_rate"]
+    cost = compute_cost(usd, buy_rate, rmb_rate)
     profit = round(received - cost, 2)
     tx = {
         "id": str(uuid.uuid4())[:8],
@@ -167,8 +185,8 @@ def add_transaction(customer: str, received: float, usd: float):
         "customer": customer,
         "received": received,
         "usd": usd,
-        "rmb_rate": rate["rmb_rate"],
-        "buy_rate": rate["buy_rate"],
+        "rmb_rate": rmb_rate,
+        "buy_rate": buy_rate,
         "cost": cost,
         "profit": profit,
     }
@@ -177,6 +195,31 @@ def add_transaction(customer: str, received: float, usd: float):
     tx_list = tx_list[-SALE_TX_MAX:]
     save_transactions(tx_list)
     return tx, tx_list
+
+
+def update_transaction(tx_id: str, customer=None, received=None, usd=None, rmb_rate=None, buy_rate=None):
+    """修改既有交易並依新數值重新計算成本／淨賺。"""
+    tx_list = load_transactions()
+    target = None
+    for t in tx_list:
+        if t["id"] == tx_id:
+            if customer is not None:
+                t["customer"] = customer
+            if received is not None:
+                t["received"] = received
+            if usd is not None:
+                t["usd"] = usd
+            if rmb_rate is not None:
+                t["rmb_rate"] = rmb_rate
+            if buy_rate is not None:
+                t["buy_rate"] = buy_rate
+            t["cost"] = compute_cost(t["usd"], t["buy_rate"], t["rmb_rate"])
+            t["profit"] = round(t["received"] - t["cost"], 2)
+            target = t
+    if target is None:
+        return None, None
+    save_transactions(tx_list)
+    return target, tx_list
 
 
 def get_today_summary():
@@ -229,6 +272,16 @@ class AddTransactionBody(BaseModel):
     customer: str
     received: float
     usd: float
+    rmb_rate: float | None = None
+    buy_rate: float | None = None
+
+
+class UpdateTransactionBody(BaseModel):
+    customer: str | None = None
+    received: float | None = None
+    usd: float | None = None
+    rmb_rate: float | None = None
+    buy_rate: float | None = None
 
 
 # ---------- 庫存 API（給 Mini App 網頁呼叫）----------
@@ -292,9 +345,24 @@ def api_set_rate(body: SetRateBody):
 
 @app.post("/api/sales/transactions")
 def api_add_transaction(body: AddTransactionBody):
-    tx, tx_list = add_transaction(body.customer, body.received, body.usd)
+    tx, tx_list = add_transaction(body.customer, body.received, body.usd, body.rmb_rate, body.buy_rate)
     if tx is None:
         raise HTTPException(status_code=400, detail="今天還沒設定匯率")
+    return get_today_summary()
+
+
+@app.patch("/api/sales/transactions/{tx_id}")
+def api_update_transaction(tx_id: str, body: UpdateTransactionBody):
+    tx, tx_list = update_transaction(
+        tx_id,
+        customer=body.customer,
+        received=body.received,
+        usd=body.usd,
+        rmb_rate=body.rmb_rate,
+        buy_rate=body.buy_rate,
+    )
+    if tx is None:
+        raise HTTPException(status_code=404, detail="transaction not found")
     return get_today_summary()
 
 
@@ -320,7 +388,18 @@ async def telegram_webhook(
         return {"ok": True}
 
     chat_id = message["chat"]["id"]
-    text = message.get("text", "")
+    text = message.get("text", "").strip()
+    user_id = message.get("from", {}).get("id")
+
+    # /myid 永遠可用，方便你查自己的 Telegram ID 拿去設定管理員名單
+    if text == "/myid":
+        await tg_send_message(chat_id, f"你的 Telegram ID 是：{user_id}")
+        return {"ok": True}
+
+    # 管理員權限檢查：設定了 ADMIN_TELEGRAM_IDS 才會限制，沒設定就不限制任何人
+    if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+        await tg_send_message(chat_id, f"你沒有權限使用這個機器人。你的 ID 是 {user_id}，請聯絡管理員加入白名單。")
+        return {"ok": True}
 
     if text == "/start":
         await tg_send_message(
@@ -329,6 +408,8 @@ async def telegram_webhook(
             "也可以直接打 -N 扣第 N 個項目 1 個，例如 -2；打 -N*M 扣 M 個，例如 -1*4。\n\n"
             "代儲記帳：先設定今日匯率 /匯率 人民幣匯率 買進匯率，例如 /匯率 4.36 5.05；\n"
             "之後直接打「客戶 收款 美金價格」新增一筆，例如 柯宇 2000 86；\n"
+            "美金欄位支援乘法，例如 65*2 會算成 130；\n"
+            "也可以整行帶自訂匯率，例如 路人甲 2900 100 4.83 5.85，只會套用在這一筆；\n"
             "打 /日結 查看今天總覽。",
         )
     elif text == "/list":
@@ -338,9 +419,13 @@ async def telegram_webhook(
         summary = get_today_summary()
         await tg_send_message(chat_id, format_summary_text(summary))
     else:
-        rate_match = re.fullmatch(r"/匯率\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", text.strip())
-        adjust_match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text.strip())
-        tx_match = re.fullmatch(r"(\S+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", text.strip())
+        rate_match = re.fullmatch(r"/匯率\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", text)
+        adjust_match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text)
+        num_expr = r"\d+(?:\.\d+)?(?:\*\d+(?:\.\d+)?)?"
+        tx_match = re.fullmatch(
+            rf"(\S+)\s+({num_expr})\s+({num_expr})(?:\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?))?",
+            text,
+        )
 
         if rate_match:
             rmb_rate = float(rate_match.group(1))
@@ -360,9 +445,11 @@ async def telegram_webhook(
                 )
         elif tx_match:
             customer = tx_match.group(1)
-            received = float(tx_match.group(2))
-            usd = float(tx_match.group(3))
-            tx, tx_list = add_transaction(customer, received, usd)
+            received = parse_amount_expr(tx_match.group(2))
+            usd = parse_amount_expr(tx_match.group(3))
+            custom_rmb = float(tx_match.group(4)) if tx_match.group(4) else None
+            custom_buy = float(tx_match.group(5)) if tx_match.group(5) else None
+            tx, tx_list = add_transaction(customer, received, usd, custom_rmb, custom_buy)
             if tx is None:
                 await tg_send_message(chat_id, "今天還沒設定匯率，先打 /匯率 人民幣匯率 買進匯率，例如 /匯率 4.36 5.05")
             else:
