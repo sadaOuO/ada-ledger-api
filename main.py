@@ -541,14 +541,24 @@ async def telegram_webhook(
             "美金欄位支援乘法，例如 65*2 會算成 130；\n"
             "非美金計價商品（面額×比例），可只覆寫買進匯率、沿用當天人民幣匯率，例如 路人乙 700 640 0.177；\n"
             "也可以整行帶自訂匯率，例如 路人甲 2900 100 4.83 5.85，只會套用在這一筆；\n"
-            "打 /日結 查看今天總覽。",
+            "打 /日結 查看今天總覽；\n"
+            "打 /查詢 2026-08-10 查看指定某一天的總覽；\n"
+            "打 /月查詢 2026-08 查看指定某個月的總覽。",
         )
     elif text == "/list":
         items = load_items()
         await tg_send_message(chat_id, format_items_text(items))
-    elif text == "/日結":
+elif text == "/日結":
         summary = get_today_summary()
         await tg_send_message(chat_id, format_summary_text(summary))
+    elif re.fullmatch(r"/查詢\s+\d{4}-\d{2}-\d{2}", text):
+        query_date = text.split()[1]
+        summary = get_date_summary(query_date)
+        await tg_send_message(chat_id, format_summary_text(summary))
+    elif re.fullmatch(r"/月查詢\s+\d{4}-\d{2}", text):
+        query_month = text.split()[1]
+        summary = get_month_summary(query_month)
+        await tg_send_message(chat_id, format_month_summary_text(summary))
     else:
         rate_match = re.fullmatch(r"/匯率\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", text)
         adjust_match = re.fullmatch(r"-(\d+)(?:\*(\d+))?", text)
