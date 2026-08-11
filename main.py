@@ -548,7 +548,7 @@ async def telegram_webhook(
     elif text == "/list":
         items = load_items()
         await tg_send_message(chat_id, format_items_text(items))
-elif text == "/日結":
+    elif text == "/日結":
         summary = get_today_summary()
         await tg_send_message(chat_id, format_summary_text(summary))
     elif re.fullmatch(r"/查詢\s+\d{4}-\d{2}-\d{2}", text):
