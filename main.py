@@ -677,6 +677,126 @@ async def cron_monthly_close(token: str = ""):
     return {"ok": True, "month": month_str, "count": summary["count"]}
 
 
+# ---------- 上游庫存系統：出庫通知 ----------
+# 每分鐘由外部排程呼叫 /api/cron/stock-export?token=CRON_SECRET，
+# 抓上游後台「出庫明細」第一頁，有新出庫就發 Telegram。
+STOCK_BASE_URL = os.environ.get("STOCK_BASE_URL", "http://43.155.5.87").rstrip("/")
+STOCK_LOGIN_PATH = os.environ.get("STOCK_LOGIN_PATH", "/prilic/apis/login")
+STOCK_ACCOUNT = os.environ.get("STOCK_ACCOUNT", "")
+STOCK_PASSWORD = os.environ.get("STOCK_PASSWORD", "")
+# 出庫通知發到哪些對話；沒設定就沿用 TARGET_CHAT_IDS
+STOCK_NOTIFY_CHAT_IDS = [
+    int(x) for x in os.environ.get("STOCK_NOTIFY_CHAT_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+] or TARGET_CHAT_IDS
+STOCK_TOKEN_KEY = "stock:token"
+STOCK_SEEN_KEY = "stock:export_seen"
+STOCK_SEEN_MAX = 1000
+
+
+async def stock_login(client: httpx.AsyncClient):
+    resp = await client.post(
+        STOCK_BASE_URL + STOCK_LOGIN_PATH,
+        json={"accountName": STOCK_ACCOUNT, "pwd": STOCK_PASSWORD},
+        timeout=15,
+    )
+    data = resp.json()
+    if data.get("resCode") != 0:
+        raise RuntimeError(f"上游登入失敗：{data.get('resMsg') or resp.status_code}")
+    token = (
+        resp.headers.get("Authorization")
+        or resp.headers.get("Token")
+        or (data.get("resData") or {}).get("token")
+    )
+    if not token:
+        raise RuntimeError("上游登入成功但找不到 token")
+    token = token.replace("Bearer ", "").strip()
+    redis.set(STOCK_TOKEN_KEY, token)
+    return token
+
+
+async def stock_fetch_exports(client: httpx.AsyncClient, retry: bool = True):
+    token = redis.get(STOCK_TOKEN_KEY) or await stock_login(client)
+    resp = await client.post(
+        STOCK_BASE_URL + "/prilic/apis/report/receipt/details",
+        json={"del_flag": 0, "export": 1, "pagerIndex": 1, "pagerNum": 50},
+        headers={"Token": token},
+        timeout=15,
+    )
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    if resp.status_code != 200 or data.get("resCode") != 0:
+        if retry:  # token 過期 → 重新登入再試一次
+            redis.delete(STOCK_TOKEN_KEY)
+            return await stock_fetch_exports(client, retry=False)
+        raise RuntimeError(f"上游查詢失敗：{data.get('resMsg') or resp.status_code}")
+    return (data.get("resData") or {}).get("list") or []
+
+
+def format_export_text(rows):
+    groups = {}
+    for r in rows:
+        key = (r.get("game_name") or "?", r.get("package_name") or "?", r.get("package_fee") or "")
+        groups.setdefault(key, []).append(r)
+    total = 0.0
+    lines = [f"📤 出庫 {len(rows)} 筆"]
+    for (game, pkg, fee), rs in groups.items():
+        cnt = f" ×{len(rs)}" if len(rs) > 1 else ""
+        lines.append(f"• {game}｜{pkg}｜{fee}{cnt}")
+        try:
+            total += float(fee) * len(rs)
+        except (TypeError, ValueError):
+            pass
+    lines.append(f"合計：{round(total, 2)}")
+    lines.append("━━━━━━━━━━━━━")
+    for r in rows[:20]:
+        warn = f"\n  ⚠️ {r['invalid_reason']}" if r.get("invalid_reason") else ""
+        lines.append(f"{(r.get('use_time') or '')[5:]}｜{r.get('order_no')}｜{r.get('owner') or ''}{warn}")
+    if len(rows) > 20:
+        lines.append(f"…還有 {len(rows) - 20} 筆")
+    return "\n".join(lines)[:4000]
+
+
+@app.api_route("/api/cron/stock-export", methods=["GET", "POST"])
+async def cron_stock_export(token: str = ""):
+    if not CRON_SECRET or token != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="invalid token")
+    if not (STOCK_ACCOUNT and STOCK_PASSWORD):
+        return {"ok": False, "error": "STOCK_ACCOUNT / STOCK_PASSWORD 未設定"}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            rows = await stock_fetch_exports(client)
+        except Exception as e:
+            print(f"[stock] {e}")
+            return {"ok": False, "error": str(e)}
+
+    raw = redis.get(STOCK_SEEN_KEY)
+    first_run = raw is None
+    seen = json.loads(raw) if raw else []
+    seen_set = set(seen)
+    new_rows = [r for r in rows if r.get("un_id") is not None and r["un_id"] not in seen_set]
+    if not new_rows:
+        return {"ok": True, "new": 0}
+
+    seen = (seen + [r["un_id"] for r in new_rows])[-STOCK_SEEN_MAX:]
+    redis.set(STOCK_SEEN_KEY, json.dumps(seen))
+    if first_run:
+        # 第一次執行只記住目前的資料，不把舊的出庫全部發出去
+        return {"ok": True, "new": 0, "initialized": len(new_rows)}
+
+    new_rows.sort(key=lambda r: r.get("use_time") or "")
+    text = format_export_text(new_rows)
+    for cid in STOCK_NOTIFY_CHAT_IDS:
+        try:
+            await tg_send_message(cid, text)
+        except Exception as e:
+            print(f"[stock] 發送給 {cid} 失敗：{e}")
+    return {"ok": True, "new": len(new_rows)}
+
+
 @app.get("/")
 def health():
     return {"status": "ok"}
