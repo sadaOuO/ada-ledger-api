@@ -752,7 +752,7 @@ def format_export_text(rows):
     lines.append(f"合計：{round(total, 2)}")
     lines.append("━━━━━━━━━━━━━")
     for r in rows[:20]:
-        warn = f"\n  ⚠️ {r['invalid_reason']}" if r.get("invalid_reason") else ""
+        warn = ""
         lines.append(f"{(r.get('use_time') or '')[5:]}｜{r.get('order_no')}｜{r.get('owner') or ''}{warn}")
     if len(rows) > 20:
         lines.append(f"…還有 {len(rows) - 20} 筆")
