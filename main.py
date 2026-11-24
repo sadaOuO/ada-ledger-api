@@ -165,7 +165,7 @@ def load_log():
 
 def push_log(name: str, amount: int = 1):
     log = load_log()
-    log.insert(0, {"name": name, "amount": amount, "time": time.strftime("%m/%d %H:%M")})
+    log.insert(0, {"name": name, "amount": amount, "time": datetime.now(TW_TZ).strftime("%m/%d %H:%M")})
     log = log[:LOG_MAX]
     redis.set(LOG_KEY, json.dumps(log, ensure_ascii=False))
     return log
@@ -389,6 +389,9 @@ class AddItemBody(BaseModel):
     name: str = "新項目"
     qty: int = 0
 
+class ReorderItemsBody(BaseModel):
+    order: list[str]
+
 
 class SetRateBody(BaseModel):
     rmb_rate: float
@@ -456,6 +459,17 @@ def delete_item(item_id: str):
     items = [it for it in load_items() if it["id"] != item_id]
     save_items(items)
     return {"items": items}
+
+@app.post("/api/items/reorder")
+def reorder_items(body: ReorderItemsBody):
+    """依前端拖曳後的順序重新排列庫存項目，body.order 是一串 item id。"""
+    items = load_items()
+    by_id = {it["id"]: it for it in items}
+    new_items = [by_id[i] for i in body.order if i in by_id]
+    missing_ids = set(by_id) - set(body.order)
+    new_items.extend(it for it in items if it["id"] in missing_ids)
+    save_items(new_items)
+    return {"items": new_items}
 
 
 # ---------- 代儲交易記錄 API（給 Mini App 網頁呼叫）----------
