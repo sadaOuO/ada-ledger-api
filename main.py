@@ -788,6 +788,12 @@ async def cron_stock_export(token: str = ""):
         return {"ok": True, "new": 0, "initialized": len(new_rows)}
 
     new_rows.sort(key=lambda r: r.get("use_time") or "")
+        # 只通知指定出庫帳戶（預設 sada），多個用逗號分隔
+    owners = [x.strip() for x in os.environ.get("STOCK_OWNER_FILTER", "sada").split(",") if x.strip()]
+    if owners:
+        new_rows = [r for r in new_rows if (r.get("owner") or "") in owners]
+        if not new_rows:
+            return {"ok": True, "new": 0}
     text = format_export_text(new_rows)
     for cid in STOCK_NOTIFY_CHAT_IDS:
         try:
